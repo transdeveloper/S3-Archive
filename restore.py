@@ -11,7 +11,6 @@
 """
 from __future__ import annotations
 import argparse
-import os
 import sqlite3
 import sys
 import tempfile
@@ -35,7 +34,18 @@ def download_manifest(s3, bucket: str, prefix: str, run_id: str, dest: Path) -> 
     key = f"{prefix.strip('/')}/{run_id}/manifest/files.sqlite"
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading manifest s3://{bucket}/{key}")
-    s3.download_file(bucket, key, str(dest))
+    try:
+        s3.download_file(bucket, key, str(dest))
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "Not Found"):
+            print(
+                f"Manifest not found: s3://{bucket}/{key}\n"
+                "The archive run is probably still in progress "
+                "(manifest is published only at the end).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
     return dest
 
 
@@ -63,17 +73,15 @@ def ensure_restored(s3, bucket: str, key: str, storage_class: str) -> bool:
         print(f"ERROR: cannot head {key}: {e}", file=sys.stderr)
         return False
 
-    # Glacier Instant Retrieval is always available
     if storage_class == "GLACIER_IR":
         return True
 
-    # Deep Archive needs an explicit restore
     restore_status = head.get("Restore", "")
     if 'ongoing-request="true"' in restore_status:
         print(f"  Restore already in progress for {key}")
         return False
     if 'ongoing-request="false"' in restore_status:
-        return True  # temporarily restored
+        return True
 
     print(f"  Initiating Deep Archive restore for {key} (this can take 12-48 h)")
     s3.restore_object(
@@ -116,11 +124,9 @@ def restore_file(
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if zip_member is None:
-        # Individual object
         print(f"Downloading {relative}")
         s3.download_file(bucket, object_key, str(dest))
     else:
-        # Inside a zip – download zip to temp, extract one member
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = Path(tmp) / "chunk.zip"
             print(f"Downloading zip for {relative}")
