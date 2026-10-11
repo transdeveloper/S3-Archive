@@ -1,0 +1,8 @@
+{
+  "source_dir": "~/Downloads",
+  "work_dir": "~/s3-archive-work",
+  "bucket": "soabcr",
+  "prefix": "archive",
+  "aws_profile": "default",
+  "aws_region": "eu-central-1"
+}
