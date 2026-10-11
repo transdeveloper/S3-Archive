@@ -12,6 +12,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -55,6 +56,8 @@ DEFAULT_CONFIG = {
     ],
 }
 
+log = logging.getLogger("archive")
+
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -91,7 +94,6 @@ def is_excluded(relative: str, name: str, patterns: list[str]) -> bool:
     for pat in patterns:
         if fnmatch.fnmatch(relative, pat) or fnmatch.fnmatch(name, pat):
             return True
-        # Also match directory components (e.g. node_modules anywhere)
         if any(fnmatch.fnmatch(part, pat.rstrip("/**").rstrip("/*")) for part in relative.split("/")):
             return True
     return False
@@ -101,11 +103,9 @@ def iter_files(source: Path, config: dict) -> Iterator[Path]:
     for root, dirs, names in os.walk(source, followlinks=config["follow_symlinks"]):
         root_path = Path(root)
 
-        # Prune excluded directories early so we don't even descend into them
         if not config["follow_symlinks"]:
             dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
 
-        # Remove excluded dirs from further walking
         kept_dirs = []
         for d in dirs:
             rel_dir = (root_path / d).relative_to(source).as_posix()
@@ -122,17 +122,16 @@ def iter_files(source: Path, config: dict) -> Iterator[Path]:
                 continue
 
             if file.is_symlink() and not config["follow_symlinks"]:
-                print(f"SKIP symlink: {relative}", file=sys.stderr)
+                log.info("SKIP symlink: %s", relative)
                 continue
 
             try:
                 if not file.is_file():
                     continue
-                # Probe readability early
                 with file.open("rb"):
                     pass
             except OSError as e:
-                print(f"SKIP unreadable: {relative} ({e})", file=sys.stderr)
+                log.warning("SKIP unreadable: %s (%s)", relative, e)
                 continue
 
             yield file
@@ -210,6 +209,7 @@ class Archiver:
                 region_name=config["aws_region"],
             )
             self.s3 = session.client("s3")
+        log.info("Run %s started (upload=%s)", run_id, upload)
 
     def object_key(self, tier: str, name: str) -> str:
         return f"{self.config['prefix'].strip('/')}/{self.run_id}/{tier}/{name}"
@@ -219,9 +219,10 @@ class Archiver:
     ) -> None:
         bucket = self.config["bucket"]
         if not self.upload:
-            print(f"DRY RUN upload {path.name} -> s3://{bucket}/{key} [{storage_class}]")
+            log.info("DRY RUN upload %s -> s3://%s/%s [%s]", path.name, bucket, key, storage_class)
             return
         try:
+            log.info("Uploading %s -> s3://%s/%s [%s]", path.name, bucket, key, storage_class)
             self.s3.upload_file(
                 str(path),
                 bucket,
@@ -246,6 +247,7 @@ class Archiver:
             raise RuntimeError(
                 f"Verification mismatch for s3://{bucket}/{key}; source files remain untouched."
             )
+        log.info("Verified %s", key)
         self.db.execute(
             "INSERT OR REPLACE INTO objects VALUES (?, ?, ?, ?, ?, ?)",
             (key, bucket, storage_class, path.stat().st_size, digest, iso_now()),
@@ -269,6 +271,7 @@ class Archiver:
     def make_zip(self, tier: str, sequence: int, pending: list[Pending]) -> None:
         name = f"chunk-{sequence:06d}.zip"
         path = self.work / name
+        log.info("Creating %s (%d files, tier=%s)", name, len(pending), tier)
         with zipfile.ZipFile(
             path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
         ) as archive:
@@ -292,7 +295,7 @@ class Archiver:
                         item.relative,
                     )
                 except OSError as e:
-                    print(f"SKIP unreadable during zip: {item.relative} ({e})", file=sys.stderr)
+                    log.warning("SKIP unreadable during zip: %s (%s)", item.relative, e)
                     continue
         zip_digest, _ = sha256_file(path)
         s3_class = "GLACIER_IR" if tier == "instant" else "DEEP_ARCHIVE"
@@ -305,7 +308,7 @@ class Archiver:
         try:
             digest, total = sha256_file(item.path)
         except OSError as e:
-            print(f"SKIP unreadable: {item.relative} ({e})", file=sys.stderr)
+            log.warning("SKIP unreadable: %s (%s)", item.relative, e)
             return
         key = self.object_key(item.tier, "files/" + item.relative)
         s3_class = "GLACIER_IR" if item.tier == "instant" else "DEEP_ARCHIVE"
@@ -318,6 +321,7 @@ class Archiver:
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         digest, _ = sha256_file(self.db_path)
         key = f"{self.config['prefix'].strip('/')}/{self.run_id}/manifest/files.sqlite"
+        log.info("Publishing manifest")
         self.upload_and_verify(self.db_path, key, "STANDARD", digest)
 
     def run(self) -> None:
@@ -331,7 +335,7 @@ class Archiver:
             try:
                 size = path.stat().st_size
             except OSError as e:
-                print(f"SKIP unreadable: {path.relative_to(self.source)} ({e})", file=sys.stderr)
+                log.warning("SKIP unreadable: %s (%s)", path.relative_to(self.source), e)
                 continue
 
             item = Pending(
@@ -358,9 +362,11 @@ class Archiver:
                 sequences[tier] += 1
                 self.make_zip(tier, sequences[tier], pending[tier])
         self.publish_manifest()
-        print(
-            f"Completed {'upload' if self.upload else 'dry run'} for {count} files. "
-            f"Local manifest: {self.db_path}"
+        log.info(
+            "Completed %s for %d files. Local manifest: %s",
+            "upload" if self.upload else "dry run",
+            count,
+            self.db_path,
         )
 
 
@@ -369,7 +375,15 @@ def main() -> int:
     parser.add_argument("--config", required=True, type=Path, help="JSON configuration file")
     parser.add_argument("--upload", action="store_true", help="Perform uploads; omit for a safe dry run")
     parser.add_argument("--keep-work", action="store_true", help="Keep generated ZIPs after a successful upload")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     try:
         config = read_config(args.config)
         run_id = f"run-{iso_now()}-{uuid.uuid4().hex[:8]}"
@@ -377,10 +391,10 @@ def main() -> int:
         job.run()
         if args.upload and not args.keep_work:
             shutil.rmtree(job.work)
-            print("Removed generated local work files; originals were never modified.")
+            log.info("Removed generated local work files; originals were never modified.")
         return 0
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        log.error("%s", error)
         return 2
 
 
