@@ -17,9 +17,11 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,11 +30,23 @@ from typing import Iterator
 try:
     import boto3
     from botocore.exceptions import BotoCoreError, ClientError
-except ImportError:  # Keeps --dry-run usable before boto3 is installed.
+    from boto3.s3.transfer import TransferConfig
+except ImportError:
     boto3 = None
     BotoCoreError = ClientError = Exception
+    TransferConfig = None
 
 CHUNK_BYTES = 1024 * 1024
+
+# Aggressive multipart settings for faster large-file uploads
+TRANSFER_CONFIG = None
+if TransferConfig is not None:
+    TRANSFER_CONFIG = TransferConfig(
+        multipart_threshold=8 * 1024 * 1024,    # 8 MiB – start multipart sooner
+        max_concurrency=12,                     # 10 parts in parallel per file
+        multipart_chunksize=16 * 1024 * 1024,   # 16 MiB parts
+        use_threads=True,
+    )
 
 DEFAULT_CONFIG = {
     "source_dir": "~/Downloads",
@@ -43,6 +57,7 @@ DEFAULT_CONFIG = {
     "prefix": "archive",
     "zip_chunk_bytes": 268435456,        # 256 MiB
     "small_file_bytes": 1048576,         # 1 MiB
+    "upload_workers": 8,                 # concurrent file/zip uploads
     "instant_extensions": [
         ".pdf", ".txt", ".md", ".csv", ".json",
         ".doc", ".docx", ".xls", ".xlsx",
@@ -52,7 +67,7 @@ DEFAULT_CONFIG = {
     "exclude_globs": [
         ".DS_Store",
         "**/node_modules/**",
-        "**/node_modules"
+        "**/node_modules",
     ],
 }
 
@@ -147,7 +162,7 @@ def storage_class(file: Path, source: Path, config: dict) -> str:
 
 
 def new_db(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, check_same_thread=False)
     connection.executescript("""
         PRAGMA journal_mode=WAL;
         CREATE TABLE runs (
@@ -193,6 +208,7 @@ class Archiver:
         self.work.mkdir(parents=True, exist_ok=False)
         self.db_path = self.work / "files.sqlite"
         self.db = new_db(self.db_path)
+        self.db_lock = threading.Lock()
         self.db.execute(
             "INSERT INTO runs VALUES (?, ?, ?, ?)",
             (run_id, iso_now(), str(self.source), json.dumps(config, sort_keys=True)),
@@ -208,8 +224,16 @@ class Archiver:
                 profile_name=config["aws_profile"],
                 region_name=config["aws_region"],
             )
-            self.s3 = session.client("s3")
-        log.info("Run %s started (upload=%s)", run_id, upload)
+            self.s3 = session.client(
+                "s3",
+                config=boto3.session.Config(
+                    retries={"max_attempts": 10, "mode": "adaptive"},
+                    connect_timeout=60,
+                    read_timeout=120,
+                ),
+            )
+        log.info("Run %s started (upload=%s, workers=%d)",
+                 run_id, upload, config.get("upload_workers", 4))
 
     def object_key(self, tier: str, name: str) -> str:
         return f"{self.config['prefix'].strip('/')}/{self.run_id}/{tier}/{name}"
@@ -221,25 +245,42 @@ class Archiver:
         if not self.upload:
             log.info("DRY RUN upload %s -> s3://%s/%s [%s]", path.name, bucket, key, storage_class)
             return
-        try:
-            log.info("Uploading %s -> s3://%s/%s [%s]", path.name, bucket, key, storage_class)
-            self.s3.upload_file(
-                str(path),
-                bucket,
-                key,
-                ExtraArgs={
-                    "StorageClass": storage_class,
-                    "Metadata": {
-                        "sha256": digest,
-                        "archive-run": self.run_id,
+
+        max_attempts = 5
+        head = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                log.info(
+                    "Uploading %s -> s3://%s/%s [%s] (attempt %d/%d)",
+                    path.name, bucket, key, storage_class, attempt, max_attempts,
+                )
+                self.s3.upload_file(
+                    str(path),
+                    bucket,
+                    key,
+                    ExtraArgs={
+                        "StorageClass": storage_class,
+                        "Metadata": {
+                            "sha256": digest,
+                            "archive-run": self.run_id,
+                        },
                     },
-                },
-            )
-            head = self.s3.head_object(Bucket=bucket, Key=key)
-        except (BotoCoreError, ClientError) as error:
-            raise RuntimeError(
-                f"Upload/verification failed for s3://{bucket}/{key}: {error}"
-            ) from error
+                    Config=TRANSFER_CONFIG,
+                )
+                head = self.s3.head_object(Bucket=bucket, Key=key)
+                break
+            except (BotoCoreError, ClientError) as error:
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        f"Upload/verification failed for s3://{bucket}/{key}: {error}"
+                    ) from error
+                wait = 2 ** attempt
+                log.warning("Upload attempt %d failed (%s). Retrying in %ds…", attempt, error, wait)
+                time.sleep(wait)
+
+        if head is None:
+            raise RuntimeError(f"Upload failed after {max_attempts} attempts: s3://{bucket}/{key}")
+
         if (
             head["ContentLength"] != path.stat().st_size
             or head.get("Metadata", {}).get("sha256") != digest
@@ -248,11 +289,12 @@ class Archiver:
                 f"Verification mismatch for s3://{bucket}/{key}; source files remain untouched."
             )
         log.info("Verified %s", key)
-        self.db.execute(
-            "INSERT OR REPLACE INTO objects VALUES (?, ?, ?, ?, ?, ?)",
-            (key, bucket, storage_class, path.stat().st_size, digest, iso_now()),
-        )
-        self.db.commit()
+        with self.db_lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO objects VALUES (?, ?, ?, ?, ?, ?)",
+                (key, bucket, storage_class, path.stat().st_size, digest, iso_now()),
+            )
+            self.db.commit()
 
     def record_file(
         self,
@@ -263,12 +305,15 @@ class Archiver:
         key: str,
         member: str | None,
     ) -> None:
-        self.db.execute(
-            "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (relative, size, digest, tier, key, member, iso_now()),
-        )
+        with self.db_lock:
+            self.db.execute(
+                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (relative, size, digest, tier, key, member, iso_now()),
+            )
+            self.db.commit()
 
-    def make_zip(self, tier: str, sequence: int, pending: list[Pending]) -> None:
+    def make_zip(self, tier: str, sequence: int, pending: list[Pending]) -> Path:
+        """Build a zip and return its path (upload happens separately)."""
         name = f"chunk-{sequence:06d}.zip"
         path = self.work / name
         log.info("Creating %s (%d files, tier=%s)", name, len(pending), tier)
@@ -297,12 +342,18 @@ class Archiver:
                 except OSError as e:
                     log.warning("SKIP unreadable during zip: %s (%s)", item.relative, e)
                     continue
+        return path
+
+    def upload_zip(self, path: Path, tier: str, sequence: int) -> None:
+        name = f"chunk-{sequence:06d}.zip"
         zip_digest, _ = sha256_file(path)
-        s3_class = "GLACIER_IR" if tier == "instant" else "DEEP_ARCHIVE"
+        # Zips are always Deep Archive — never Glacier Instant Retrieval
         self.upload_and_verify(
-            path, self.object_key(tier, name), s3_class, zip_digest
+            path,
+            self.object_key(tier, name),
+            "DEEP_ARCHIVE",
+            zip_digest,
         )
-        self.db.commit()
 
     def upload_large(self, item: Pending) -> None:
         try:
@@ -314,11 +365,11 @@ class Archiver:
         s3_class = "GLACIER_IR" if item.tier == "instant" else "DEEP_ARCHIVE"
         self.upload_and_verify(item.path, key, s3_class, digest)
         self.record_file(item.relative, total, digest, item.tier, key, None)
-        self.db.commit()
 
     def publish_manifest(self) -> None:
-        self.db.commit()
-        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        with self.db_lock:
+            self.db.commit()
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         digest, _ = sha256_file(self.db_path)
         key = f"{self.config['prefix'].strip('/')}/{self.run_id}/manifest/files.sqlite"
         log.info("Publishing manifest")
@@ -327,10 +378,26 @@ class Archiver:
     def run(self) -> None:
         if not self.source.is_dir():
             raise ValueError(f"source_dir is not a directory: {self.source}")
+
         pending: dict[str, list[Pending]] = {"instant": [], "deep": []}
         pending_bytes = {"instant": 0, "deep": 0}
         sequences = {"instant": 0, "deep": 0}
         count = 0
+
+        # Collect work items: either a large file or a finished zip
+        upload_jobs: list[tuple] = []  # (callable, args)
+
+        workers = self.config.get("upload_workers", 4)
+
+        def flush_zip(tier: str) -> None:
+            if not pending[tier]:
+                return
+            sequences[tier] += 1
+            seq = sequences[tier]
+            zip_path = self.make_zip(tier, seq, pending[tier])
+            upload_jobs.append((self.upload_zip, (zip_path, tier, seq)))
+            pending[tier], pending_bytes[tier] = [], 0
+
         for path in iter_files(self.source, self.config):
             try:
                 size = path.stat().st_size
@@ -344,23 +411,36 @@ class Archiver:
                 storage_class(path, self.source, self.config),
             )
             if size > self.config["small_file_bytes"]:
-                self.upload_large(item)
+                upload_jobs.append((self.upload_large, (item,)))
             else:
                 tier = item.tier
                 if (
                     pending[tier]
                     and pending_bytes[tier] + size > self.config["zip_chunk_bytes"]
                 ):
-                    sequences[tier] += 1
-                    self.make_zip(tier, sequences[tier], pending[tier])
-                    pending[tier], pending_bytes[tier] = [], 0
+                    flush_zip(tier)
                 pending[tier].append(item)
                 pending_bytes[tier] += size
             count += 1
+
         for tier in ("instant", "deep"):
-            if pending[tier]:
-                sequences[tier] += 1
-                self.make_zip(tier, sequences[tier], pending[tier])
+            flush_zip(tier)
+
+        # Run uploads concurrently
+        log.info("Starting %d upload jobs with %d workers", len(upload_jobs), workers)
+        errors: list[Exception] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fn, *args): (fn, args) for fn, args in upload_jobs}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    log.error("Upload job failed: %s", e)
+                    errors.append(e)
+
+        if errors:
+            raise RuntimeError(f"{len(errors)} upload job(s) failed; see log above")
+
         self.publish_manifest()
         log.info(
             "Completed %s for %d files. Local manifest: %s",
